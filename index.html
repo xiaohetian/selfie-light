@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>自拍补光</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;overscroll-behavior:none;touch-action:none;background:#000;
+  font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#fff;
+  user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+#light{position:fixed;inset:0;height:100dvh;background:#FFD9A0}
+#cam{position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none}
+#cv{display:none}
+.fade{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:5;pointer-events:none;
+  opacity:0;transition:opacity .35s ease;mix-blend-mode:difference;color:#fff;white-space:nowrap}
+.fade.show{opacity:1}
+#hint{font-size:15px;letter-spacing:.06em}
+#toast{font-size:14px}
+#pct{font-size:34px;font-weight:200}
+</style>
+</head>
+<body>
+<div id="light"></div>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="cv"></canvas>
+<div class="fade" id="hint">左右换色 · 按住上下调亮度 · 双击拍照</div>
+<div class="fade" id="toast"></div>
+<div class="fade" id="pct"></div>
+
+<script>
+"use strict";
+var $ = function (id) { return document.getElementById(id); };
+var light = $("light"), hint = $("hint"), toastEl = $("toast"), pctEl = $("pct");
+var video = $("cam"), cv = $("cv");
+
+// 11 个预设色：三档白光 + 常用纯色，顺序固定
+var COLORS = [["暖白", "#FFD9A0"], ["中性白", "#FFFFFF"], ["冷白", "#DCE9FF"],
+              ["红", "#FF3B30"], ["橙", "#FF9500"], ["黄", "#FFE600"], ["绿", "#2ECC71"],
+              ["青", "#00D1C1"], ["蓝", "#0A84FF"], ["紫", "#8E44AD"], ["粉", "#FF5FA2"]];
+
+function hexToHsl(hex) {
+  var n = parseInt(hex.slice(1), 16), r = n >> 16 & 255, g = n >> 8 & 255, b = n & 255;
+  r /= 255; g /= 255; b /= 255;
+  var mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, h, s;
+  if (mx === mn) { h = s = 0; }
+  else {
+    var d = mx - mn;
+    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    h = mx === r ? (g - b) / d + (g < b ? 6 : 0)
+      : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h *= 60;
+  }
+  return { h: h, s: s * 100, l: l * 100 };
+}
+var HSL = COLORS.map(function (c) { return hexToHsl(c[1]); });
+
+var state = { i: 0, bri: 0.7 };
+
+// 亮度沿用「向白色混合」：bri 越大，明度越靠近 95
+function apply() {
+  var c = HSL[state.i];
+  var base = Math.min(c.l, 95), top = c.l > 95 ? 100 : 95;
+  var l = base + (top - base) * state.bri;
+  light.style.background = "hsl(" + c.h.toFixed(1) + " " + c.s.toFixed(1) + "% " + l.toFixed(1) + "%)";
+}
+function step(dir) {
+  state.i = (state.i + dir + HSL.length) % HSL.length;
+  apply();
+}
+
+// ---- 手势 ----
+var MOVE = 12;          // 判定滑动的位移阈值
+var TAP_MS = 400;       // 轻点最长按压时间
+var DBL_MS = 320;       // 双击间隔
+var DBL_PX = 30;        // 双击位移
+var BRI_PX = 300;       // 竖直拖满 15%–100% 所需的像素
+
+var p = null;           // 当前拖动的指针
+var lastTap = { t: 0, x: 0, y: 0 };
+var pctTimer = 0;
+
+function pctShow() {
+  pctEl.textContent = Math.round(state.bri * 100) + "%";
+  pctEl.classList.add("show");
+  clearTimeout(pctTimer);
+  pctTimer = setTimeout(pctHide, 600);
+}
+function pctHide() { pctEl.classList.remove("show"); }
+
+window.addEventListener("pointerdown", function (e) {
+  if (p) return;                    // 只认单指
+  ensureWake();
+  ensureCamera();
+  hint.classList.remove("show");
+  p = { id: e.pointerId, x0: e.clientX, y0: e.clientY, t0: performance.now(),
+        dir: null, consumed: false, startBri: state.bri };
+});
+
+window.addEventListener("pointermove", function (e) {
+  if (!p || e.pointerId !== p.id) return;
+  var dx = e.clientX - p.x0, dy = e.clientY - p.y0;
+  if (!p.dir) {                     // 首次越阈锁定方向，本次拖动不再改
+    if (Math.max(Math.abs(dx), Math.abs(dy)) < MOVE) return;
+    p.dir = Math.abs(dx) > Math.abs(dy) ? "h" : "v";
+  }
+  if (p.dir === "h") {
+    if (!p.consumed) { step(dx > 0 ? 1 : -1); p.consumed = true; }  // 一次滑动只切一个色
+  } else {
+    state.bri = Math.min(1, Math.max(0.15, p.startBri + (p.y0 - e.clientY) / BRI_PX));
+    apply();
+    pctShow();
+  }
+});
+
+function endPointer(e) {
+  if (!p || e.pointerId !== p.id) return;
+  var isTap = !p.dir && performance.now() - p.t0 < TAP_MS;
+  p = null;
+  pctHide();
+  if (!isTap) return;
+  var now = performance.now();
+  var d = Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y);
+  if (now - lastTap.t < DBL_MS && d < DBL_PX) {
+    lastTap.t = 0;
+    takePhoto();
+  } else {
+    lastTap = { t: now, x: e.clientX, y: e.clientY };
+  }
+}
+window.addEventListener("pointerup", endPointer);
+window.addEventListener("pointercancel", function (e) { p = null; pctHide(); });
+
+// ---- 屏幕常亮 ----
+var wl = null;
+function ensureWake() {
+  if (!("wakeLock" in navigator) || wl) return;
+  navigator.wakeLock.request("screen").then(function (w) {
+    wl = w;
+    w.onrelease = function () { wl = null; };
+  }).catch(function () {});
+}
+document.addEventListener("visibilitychange", function () {
+  if (document.visibilityState === "visible") ensureWake();
+});
+
+// ---- 前置相机 ----
+var camState = 0;                   // 0 未请求 1 可用 2 不可用
+function ensureCamera() {
+  if (camState !== 0) return;
+  camState = 2;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false }).then(function (s) {
+    video.srcObject = s;
+    camState = 1;
+    var r = video.play();
+    if (r && r.catch) r.catch(function () {});
+  }).catch(function () {});
+}
+
+function stamp() {
+  var d = new Date(), z = function (n) { return String(n).padStart(2, "0"); };
+  return d.getFullYear() + z(d.getMonth() + 1) + z(d.getDate()) + "-" +
+         z(d.getHours()) + z(d.getMinutes()) + z(d.getSeconds());
+}
+
+function takePhoto() {
+  if (camState !== 1 || !video.videoWidth) { toast("相机不可用"); return; }
+  cv.width = video.videoWidth;
+  cv.height = video.videoHeight;
+  cv.getContext("2d").drawImage(video, 0, 0);
+  cv.toBlob(function (b) {
+    if (!b) { toast("拍照失败"); return; }
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(b);
+    a.download = "自拍补光-" + stamp() + ".png";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+  }, "image/png");
+}
+
+var toastTimer = 0;
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { toastEl.classList.remove("show"); }, 1400);
+}
+
+// ---- 禁止系统手势干扰 ----
+window.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+document.addEventListener("gesturestart", function (e) { e.preventDefault(); });
+document.addEventListener("dblclick", function (e) { e.preventDefault(); });
+
+apply();
+hint.classList.add("show");
+setTimeout(function () { hint.classList.remove("show"); }, 3000);
+</script>
+</body>
+</html>
